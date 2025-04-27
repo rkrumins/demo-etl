@@ -1,360 +1,208 @@
-// Fixed Spark Shell Script 1: Data Processing with Resolved Column Ambiguity
-// Run with: spark-shell -i spark-shell-job1-fixed.scala
+// Fixed Spark Job 1: Data Processing (generate-test-data.scala)
+// Run with: spark-shell -i generate-test-data.scala
 
-import org.apache.spark.sql.{SparkSession, DataFrame}
+// Import necessary libraries
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
-import org.apache.spark.storage.StorageLevel
-import java.time.{LocalDate, LocalDateTime}
-import java.sql.{Date, Timestamp}
 
-// Function to log lineage information
-def logLineage(description: String, inputs: Seq[String], output: String): Unit = {
-  println(s"LINEAGE: $description")
-  println(s"LINEAGE: Inputs: ${inputs.mkString(", ")}")
-  println(s"LINEAGE: Output: $output")
-  println(s"LINEAGE: Timestamp: ${java.time.LocalDateTime.now}")
-  println("LINEAGE: " + "=" * 50)
+// Log lineage information
+def logLineage(step: String, input: String, output: String): Unit = {
+  println(s"LINEAGE: STEP=$step | INPUT=$input | OUTPUT=$output | TIME=${java.time.LocalDateTime.now}")
 }
 
-println("Starting Data Processing Job from Spark Shell")
+println("=== Starting Data Processing Job ===")
+
+// Define paths
+val inputDir = "/data/lineage"
+val outputDir = "/data/lineage/processed"
 
 try {
-  // Define paths for input files - these match what's created by generate-sample-data.sh
-  val customerFilePath = "/data/hdfs/customers.csv"
-  val ordersFilePath = "/data/hdfs/orders.csv"
-  val productsFilePath = "/data/hdfs/products.csv"
+  // Step 1: Read source data with explicit schema to ensure correct data types for joins
+  logLineage("READ_SOURCE", s"$inputDir/customers.csv,$inputDir/products.csv,$inputDir/orders.csv", "Raw DataFrames")
   
-  // External table location
-  val externalTableLocation = "/user/hive/external/processed_sales"
+  // Define explicit schemas to ensure consistent types for joining
+  val customerSchema = StructType(Array(
+    StructField("customer_id", IntegerType, false),
+    StructField("name", StringType, true),
+    StructField("email", StringType, true),
+    StructField("status", StringType, true)
+  ))
   
-  println(s"Reading from source files:")
-  println(s"- Customers: $customerFilePath")
-  println(s"- Orders: $ordersFilePath")
-  println(s"- Products: $productsFilePath")
-  println(s"Writing to external table at: $externalTableLocation")
+  val productSchema = StructType(Array(
+    StructField("product_id", IntegerType, false),
+    StructField("name", StringType, true),
+    StructField("category", StringType, true),
+    StructField("price", DoubleType, true),
+    StructField("in_stock", BooleanType, true)
+  ))
   
-  // Load data directly with inferred schema for the sample data
-  println("Reading input files from HDFS...")
+  val orderSchema = StructType(Array(
+    StructField("order_id", IntegerType, false),
+    StructField("customer_id", IntegerType, false),
+    StructField("product_id", IntegerType, false),
+    StructField("quantity", IntegerType, true),
+    StructField("order_date", DateType, true),
+    StructField("total_amount", DoubleType, true)
+  ))
   
-  // Check if files exist in HDFS
-  def hdfsFileExists(path: String): Boolean = {
-    try {
-      import org.apache.hadoop.fs.{FileSystem, Path}
-      import org.apache.hadoop.conf.Configuration
-      val conf = new Configuration()
-      val fs = FileSystem.get(conf)
-      fs.exists(new Path(path))
-    } catch {
-      case e: Exception => 
-        println(s"Error checking if file exists: $path")
-        println(e.getMessage)
-        false
-    }
-  }
-  
-  // Check each input file
-  val customersExists = hdfsFileExists(customerFilePath)
-  val ordersExists = hdfsFileExists(ordersFilePath)
-  val productsExists = hdfsFileExists(productsFilePath)
-  
-  println(s"File existence check:")
-  println(s"- Customers: $customersExists")
-  println(s"- Orders: $ordersExists")
-  println(s"- Products: $productsExists")
-  
-  if (!customersExists || !ordersExists || !productsExists) {
-    throw new Exception("One or more input files do not exist in HDFS. Please run the data generation script first.")
-  }
-  
-  // Read customer data with header
   val customersDF = spark.read
     .option("header", "true")
-    .option("inferSchema", "true")
-    .csv(customerFilePath)
-    
-  // Read orders data with header
-  val ordersDF = spark.read
-    .option("header", "true") 
-    .option("inferSchema", "true")
-    .csv(ordersFilePath)
-    
-  // Read products data with header
+    .schema(customerSchema)
+    .csv(s"$inputDir/customers.csv")
+  
   val productsDF = spark.read
     .option("header", "true")
-    .option("inferSchema", "true")
-    .csv(productsFilePath)
+    .schema(productSchema)
+    .csv(s"$inputDir/products.csv")
   
-  // Log lineage for input data loading
-  logLineage(
-    "Load Raw Data", 
-    Seq(customerFilePath, ordersFilePath, productsFilePath), 
-    "Raw DataFrames in memory"
-  )
+  val ordersDF = spark.read
+    .option("header", "true")
+    .schema(orderSchema)
+    .csv(s"$inputDir/orders.csv")
   
-  // Display schemas to verify data was loaded correctly
-  println("Customer Data Schema:")
+  // Verify data loading and schema
+  println("Customers schema:")
   customersDF.printSchema()
+  println("Customers sample:")
+  customersDF.show(3)
   
-  println("Orders Data Schema:")
-  ordersDF.printSchema()
-  
-  println("Products Data Schema:")
+  println("Products schema:")
   productsDF.printSchema()
+  println("Products sample:")
+  productsDF.show(3)
   
-  // Show some sample data
-  println("Sample data from customers:")
-  customersDF.show(5)
-  println("Sample data from orders:")
-  ordersDF.show(5)
-  println("Sample data from products:")
-  productsDF.show(5)
+  println("Orders schema:")
+  ordersDF.printSchema()
+  println("Orders sample:")
+  ordersDF.show(3)
   
-  // Cache intermediate DataFrames to improve performance
-  customersDF.persist(StorageLevel.MEMORY_AND_DISK)
-  ordersDF.persist(StorageLevel.MEMORY_AND_DISK)
-  productsDF.persist(StorageLevel.MEMORY_AND_DISK)
+  // Count records to verify data loading
+  println(s"Customer count: ${customersDF.count()}")
+  println(s"Product count: ${productsDF.count()}")
+  println(s"Order count: ${ordersDF.count()}")
   
-  // TRANSFORMATION 1: Filter active customers only 
-  // Use explicit DataFrame references to avoid ambiguity
-  val activeCustomersDF = customersDF.filter(customersDF("status") === "active")
-  println(s"Active customers count: ${activeCustomersDF.count()}")
-  activeCustomersDF.show(5)
+  // Step 2: Filter data
+  logLineage("FILTER_DATA", "Raw DataFrames", "Filtered DataFrames")
   
-  // TRANSFORMATION 2: Filter orders from last 90 days
+  // Filter active customers - verify filter condition matches actual data
+  val activeCustomersDF = customersDF.filter(col("status") === "active")
+  println(s"Active customers: ${activeCustomersDF.count()}")
+  activeCustomersDF.show(3)
+  
+  // Filter available products - verify filter condition matches actual data
+  val availableProductsDF = productsDF.filter(col("in_stock") === true)
+  println(s"Available products: ${availableProductsDF.count()}")
+  availableProductsDF.show(3)
+  
+  // Filter recent orders - verify date parsing
   val recentOrdersDF = ordersDF.filter(
-    ordersDF("order_date") > date_sub(current_date(), 90)
+    col("order_date") > lit("2023-02-01") // Note: our schema ensures proper date type
   )
-  println(s"Recent orders count: ${recentOrdersDF.count()}")
-  recentOrdersDF.show(5)
+  println(s"Recent orders: ${recentOrdersDF.count()}")
+  recentOrdersDF.show(3)
   
-  // TRANSFORMATION 3: Filter in-stock products only
-  val availableProductsDF = productsDF.filter(productsDF("in_stock") === "true")
-  println(s"Available products count: ${availableProductsDF.count()}")
-  availableProductsDF.show(5)
+  // Step 3: Join data - this is the critical part for ensuring correct joins
+  logLineage("JOIN_DATA", "Filtered DataFrames", "Sales DataFrame")
   
-  // Log lineage for filtering transformations
-  logLineage(
-    "Apply Filtering Transformations", 
-    Seq("customersDF", "ordersDF", "productsDF"), 
-    "Filtered DataFrames"
-  )
+  // Print distinct IDs to see what should match in the join
+  println("Distinct customer_id in active customers:")
+  activeCustomersDF.select("customer_id").distinct().orderBy("customer_id").show(100)
   
-  // TRANSFORMATION 4: Join data to create sales analysis
-  // For join operations, we need to be particularly careful about column ambiguity
-  val salesAnalysisDF = recentOrdersDF
-    .join(activeCustomersDF, recentOrdersDF("customer_id") === activeCustomersDF("customer_id"), "inner")
-    .join(availableProductsDF, recentOrdersDF("product_id") === availableProductsDF("product_id"), "inner")
-    .select(
-      recentOrdersDF("order_id"),
-      recentOrdersDF("customer_id"),
-      activeCustomersDF("name").as("customer_name"),
-      activeCustomersDF("email"),
-      recentOrdersDF("product_id"),
-      availableProductsDF("name").as("product_name"),
-      availableProductsDF("category"),
-      availableProductsDF("price"),
-      recentOrdersDF("quantity"),
-      recentOrdersDF("order_date"),
-      recentOrdersDF("total_amount")
-    )
+  println("Distinct product_id in available products:")
+  availableProductsDF.select("product_id").distinct().orderBy("product_id").show(100)
   
-  println("Sample data after joins:")
-  salesAnalysisDF.show(5)
+  println("Distinct customer_id and product_id in recent orders:")
+  recentOrdersDF.select("customer_id", "product_id").distinct().orderBy("customer_id", "product_id").show(100)
   
-  // Log lineage for join transformation
-  logLineage(
-    "Join Data for Sales Analysis", 
-    Seq("activeCustomersDF", "recentOrdersDF", "availableProductsDF"), 
-    "salesAnalysisDF"
+  // First join orders with customers on customer_id
+  val ordersWithCustomersDF = recentOrdersDF.join(
+    activeCustomersDF,
+    recentOrdersDF("customer_id") === activeCustomersDF("customer_id"),
+    "inner"
   )
   
-  // TRANSFORMATION 5: Add derived columns
-  val enrichedSalesDF = salesAnalysisDF
-    .withColumn("day_of_week", date_format(salesAnalysisDF("order_date"), "EEEE"))
-    .withColumn("month", date_format(salesAnalysisDF("order_date"), "MMMM"))
-    .withColumn("year", year(salesAnalysisDF("order_date")))
-    .withColumn("is_weekend", when(
-      date_format(salesAnalysisDF("order_date"), "u").isin("6", "7"), true
-    ).otherwise(false))
-    .withColumn("unit_price", salesAnalysisDF("price"))
-    .withColumn("extended_price", salesAnalysisDF("price") * salesAnalysisDF("quantity"))
-    .withColumn("discount_amount", when(salesAnalysisDF("quantity") > 10, 
-      salesAnalysisDF("price") * salesAnalysisDF("quantity") * 0.1
-    ).otherwise(0))
-    .withColumn("final_price", col("extended_price") - col("discount_amount"))
+  println("After joining orders with customers:")
+  println(s"Records: ${ordersWithCustomersDF.count()}")
+  ordersWithCustomersDF.show(3)
   
-  // Show enriched data
-  println("Sample data after enrichment:")
-  enrichedSalesDF.select("order_id", "customer_name", "product_name", "day_of_week", "is_weekend", "final_price").show(5)
-  
-  // Log lineage for enrichment transformation
-  logLineage(
-    "Enrich Sales Data with Derived Columns", 
-    Seq("salesAnalysisDF"), 
-    "enrichedSalesDF"
+  // Then join with products on product_id
+  val salesDF = ordersWithCustomersDF.join(
+    availableProductsDF,
+    ordersWithCustomersDF("product_id") === availableProductsDF("product_id"),
+    "inner"
+  ).select(
+    ordersWithCustomersDF("order_id"),
+    ordersWithCustomersDF("customer_id"),
+    activeCustomersDF("name").as("customer_name"),
+    activeCustomersDF("email"),
+    ordersWithCustomersDF("product_id"),
+    availableProductsDF("name").as("product_name"),
+    availableProductsDF("category"),
+    availableProductsDF("price"),
+    ordersWithCustomersDF("quantity"),
+    ordersWithCustomersDF("order_date"),
+    ordersWithCustomersDF("total_amount")
   )
   
-  // TRANSFORMATION 6: Calculate aggregations by product category
-  val categorySummaryDF = enrichedSalesDF
-    .groupBy(enrichedSalesDF("category"))
-    .agg(
-      count(enrichedSalesDF("order_id")).as("order_count"),
-      sum(enrichedSalesDF("quantity")).as("total_quantity"),
-      sum(enrichedSalesDF("final_price")).as("total_sales"),
-      avg(enrichedSalesDF("final_price")).as("avg_sale_value"),
-      min(enrichedSalesDF("order_date")).as("first_order_date"),
-      max(enrichedSalesDF("order_date")).as("last_order_date")
-    )
-    .orderBy(col("total_sales").desc)
+  println("Joined sales data (final result of both joins):")
+  println(s"Sales records: ${salesDF.count()}")
+  salesDF.show(5)
   
-  // Show the category summary
-  println("Category summary:")
-  categorySummaryDF.show()
+  // Step 4: Add derived columns
+  logLineage("ENHANCE_DATA", "Sales DataFrame", "Enhanced Sales DataFrame")
   
-  // Log lineage for aggregation transformation
-  logLineage(
-    "Aggregate Sales Data by Category", 
-    Seq("enrichedSalesDF"), 
-    "categorySummaryDF"
-  )
+  val enhancedSalesDF = salesDF
+    .withColumn("month", date_format(col("order_date"), "MMMM"))
+    .withColumn("year", year(col("order_date")))
+    .withColumn("unit_price", col("price"))
+    .withColumn("extended_price", col("price") * col("quantity"))
   
-  // TRANSFORMATION 7: Union the detailed and summary data
-  // First, create a compatible schema for the summary data
-  val summaryWithCompatibleSchema = categorySummaryDF
-    .withColumn("order_id", lit(null).cast(IntegerType))
-    .withColumn("customer_id", lit(null).cast(IntegerType))
-    .withColumn("customer_name", lit("SUMMARY").cast(StringType))
-    .withColumn("email", lit(null).cast(StringType))
-    .withColumn("product_id", lit(null).cast(IntegerType))
-    .withColumn("product_name", lit("CATEGORY SUMMARY").cast(StringType))
-    .withColumn("price", lit(null).cast(DoubleType))
-    .withColumn("quantity", lit(null).cast(IntegerType))
-    .withColumn("order_date", lit(null).cast(TimestampType))
-    .withColumn("total_amount", lit(null).cast(DoubleType))
-    .withColumn("day_of_week", lit(null).cast(StringType))
-    .withColumn("month", lit(null).cast(StringType))
-    .withColumn("year", lit(null).cast(IntegerType))
-    .withColumn("is_weekend", lit(null).cast(BooleanType))
-    .withColumn("unit_price", lit(null).cast(DoubleType))
-    .withColumn("extended_price", lit(null).cast(DoubleType))
-    .withColumn("discount_amount", lit(null).cast(DoubleType))
-    .withColumn("final_price", lit(null).cast(DoubleType))
+  println("Enhanced sales data:")
+  enhancedSalesDF.select("order_id", "customer_name", "product_name", "month", "extended_price").show(5)
   
-  // Make sure columns are in the same order before union
-  val enrichedSalesColumns = enrichedSalesDF.columns
-  val summaryForUnionDF = summaryWithCompatibleSchema.select(enrichedSalesColumns.map(col): _*)
+  // Step 5: Write processed data
+  logLineage("WRITE_PROCESSED", "Enhanced Sales DataFrame", s"$outputDir/sales")
   
-  // Combine detailed and summary data
-  val finalDataDF = enrichedSalesDF.union(summaryForUnionDF)
-  println("Final data sample (including summary rows):")
-  finalDataDF.show(5)
+  // Ensure output directory is clean
+  val hadoopConf = new org.apache.hadoop.conf.Configuration()
+  val hdfs = org.apache.hadoop.fs.FileSystem.get(hadoopConf)
+  val outputPath = new org.apache.hadoop.fs.Path(outputDir)
+  if (hdfs.exists(outputPath)) {
+    hdfs.delete(outputPath, true)
+    println(s"Deleted existing directory: $outputDir")
+  }
   
-  // Log lineage for final transformation
-  logLineage(
-    "Create Final Dataset with Details and Summary", 
-    Seq("enrichedSalesDF", "summaryWithCompatibleSchema"), 
-    "finalDataDF"
-  )
-  
-  // Create external Hive table
-  println("Creating external Hive table...")
-  spark.sql(s"DROP TABLE IF EXISTS sales_data_external")
-  spark.sql(
-    s"""
-      |CREATE EXTERNAL TABLE sales_data_external (
-      |  order_id INT,
-      |  customer_id INT,
-      |  customer_name STRING,
-      |  email STRING,
-      |  product_id INT,
-      |  product_name STRING,
-      |  category STRING,
-      |  price DOUBLE,
-      |  quantity INT,
-      |  order_date TIMESTAMP,
-      |  total_amount DOUBLE,
-      |  day_of_week STRING,
-      |  month STRING,
-      |  year INT,
-      |  is_weekend BOOLEAN,
-      |  unit_price DOUBLE,
-      |  extended_price DOUBLE,
-      |  discount_amount DOUBLE,
-      |  final_price DOUBLE
-      |)
-      |STORED AS PARQUET
-      |LOCATION '$externalTableLocation'
-    """.stripMargin
-  )
-  
-  // Write data to external table location
-  println("Writing data to external table location...")
-  finalDataDF.write
+  // Write data
+  enhancedSalesDF.write
     .mode("overwrite")
-    .format("parquet")
-    .save(externalTableLocation)
+    .parquet(s"$outputDir/sales")
   
-  // Log lineage for writing to external table
-  logLineage(
-    "Write Data to External Hive Table", 
-    Seq("finalDataDF"), 
-    s"Hive External Table: sales_data_external at $externalTableLocation"
-  )
+  println(s"Processed data written to: $outputDir/sales")
   
-  // Verify the data was written correctly
-  println("Verifying the external table...")
-  val verifyTableDF = spark.sql("SELECT * FROM sales_data_external LIMIT 10")
-  println("Verifying data in external table:")
-  verifyTableDF.show()
+  // Verify written data by reading it back
+  val verifyDF = spark.read.parquet(s"$outputDir/sales")
+  println("Verification of written data:")
+  println(s"Total records: ${verifyDF.count()}")
+  verifyDF.show(3)
   
-  // Count the records in the table
-  val recordCount = spark.sql("SELECT COUNT(*) FROM sales_data_external").first().getLong(0)
-  println(s"Total records in external table: $recordCount")
+  // Create Hive table for easy access in Job 2
+  spark.sql("DROP TABLE IF EXISTS processed_sales")
+  spark.sql(s"""
+    CREATE TABLE processed_sales
+    USING PARQUET
+    LOCATION '$outputDir/sales'
+  """)
   
-  // Unpersist cached DataFrames
-  customersDF.unpersist()
-  ordersDF.unpersist()
-  productsDF.unpersist()
+  println("Created Hive table: processed_sales")
   
-  // Print completion message with lineage summary
-  println(s"""
-    |==========================================================
-    |JOB COMPLETE: Data Processing with Lineage Tracking
-    |==========================================================
-    |Input Sources:
-    |  - $customerFilePath
-    |  - $ordersFilePath
-    |  - $productsFilePath
-    |
-    |Transformations Applied:
-    |  1. Filter active customers
-    |  2. Filter recent orders
-    |  3. Filter available products
-    |  4. Join data for sales analysis
-    |  5. Enrich with derived columns
-    |  6. Calculate category aggregations
-    |  7. Combine detailed and summary data
-    |
-    |Output:
-    |  - External Hive Table: sales_data_external
-    |  - Location: $externalTableLocation
-    |  - Record Count: $recordCount
-    |==========================================================
-  """.stripMargin)
+  // Confirm table creation
+  spark.sql("SHOW TABLES").show()
+  spark.sql("SELECT * FROM processed_sales LIMIT 5").show()
   
+  println("=== Data Processing Job Complete ===")
+
 } catch {
-  case e: Exception => 
-    println(s"ERROR: Data processing job failed with exception:")
-    println(s"${e.getMessage}")
-    println(s"${e.getStackTrace.mkString("\n")}")
-    
-    // Log error in lineage format
-    logLineage(
-      "ERROR: Data Processing Failed", 
-      Seq("Source Files"), 
-      s"Error: ${e.getMessage}"
-    )
-    
-    throw e
+  case e: Exception =>
+    println(s"ERROR: ${e.getMessage}")
+    e.printStackTrace()
 }
