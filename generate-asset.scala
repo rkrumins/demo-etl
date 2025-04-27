@@ -1,532 +1,294 @@
-// Fixed Spark Shell Script 2: Asset Creation with Resolved Column Ambiguity
-// Run with: spark-shell -i spark-shell-job2-fixed.scala
+// Fixed Spark Job 2: Asset Creation (generate-asset.scala)
+// Run with: spark-shell -i generate-asset.scala
 
-import org.apache.spark.sql.{SparkSession, DataFrame}
+// Import necessary libraries
 import org.apache.spark.sql.functions._
-import org.apache.spark.sql.expressions.Window
-import org.apache.spark.storage.StorageLevel
-import java.time.{LocalDate, LocalDateTime}
-import java.sql.{Date, Timestamp}
+import org.apache.spark.sql.types._
 import java.util.UUID
 
-// Function to log lineage information
-def logLineage(description: String, inputs: Seq[String], output: String): Unit = {
-  println(s"LINEAGE: $description")
-  println(s"LINEAGE: Inputs: ${inputs.mkString(", ")}")
-  println(s"LINEAGE: Output: $output")
-  println(s"LINEAGE: Timestamp: ${java.time.LocalDateTime.now}")
-  println("LINEAGE: " + "=" * 50)
+// Log lineage information
+def logLineage(step: String, input: String, output: String): Unit = {
+  println(s"LINEAGE: STEP=$step | INPUT=$input | OUTPUT=$output | TIME=${java.time.LocalDateTime.now}")
 }
 
-println("Starting Asset Creation Job from Spark Shell")
+println("=== Starting Asset Creation Job ===")
 
-// External table location (from first job)
-val externalTableLocation = "/user/hive/external/processed_sales"
-
-// Asset table location
-val assetTableLocation = "/user/hive/warehouse/sales_analytics_asset"
-
-// Metadata for lineage tracking
+// Define paths
+val inputDir = "/data/lineage/processed/sales"
+val outputDir = "/data/lineage/assets"
 val jobId = UUID.randomUUID.toString
-val jobStartTime = LocalDateTime.now
-
-println(s"Job ID: $jobId")
-println(s"Start Time: $jobStartTime")
-println(s"Reading from external table at: $externalTableLocation")
-println(s"Writing to asset table at: $assetTableLocation")
 
 try {
-  // Read from external table
-  println("Reading data from external Hive table...")
+  // Step 1: Read processed data
+  logLineage("READ_PROCESSED", inputDir, "Sales DataFrame")
   
-  // First check if the external table exists
-  println("Checking if external table exists...")
-  val tableExists = spark.catalog.tableExists("sales_data_external")
+  println("Checking if Hive table exists...")
+  val tableExists = spark.catalog.tableExists("processed_sales")
+  println(s"Table exists: $tableExists")
   
-  val salesDataDF = if (tableExists) {
-    println("Reading from Hive table 'sales_data_external'")
-    spark.table("sales_data_external")
+  // Try reading from Hive table first, fallback to direct parquet read
+  val salesDF = if (tableExists) {
+    println("Reading from Hive table: processed_sales")
+    val df = spark.table("processed_sales")
+    println(s"Read ${df.count()} records from Hive table")
+    df
   } else {
-    println("Reading directly from parquet files at: " + externalTableLocation)
-    spark.read.format("parquet").load(externalTableLocation)
+    println(s"Reading directly from parquet: $inputDir")
+    // Check if path exists
+    val hadoopConf = new org.apache.hadoop.conf.Configuration()
+    val hdfs = org.apache.hadoop.fs.FileSystem.get(hadoopConf)
+    val inputPath = new org.apache.hadoop.fs.Path(inputDir)
+    
+    if (!hdfs.exists(inputPath)) {
+      throw new Exception(s"Input path not found: $inputDir. Please run Job 1 first.")
+    }
+    
+    val df = spark.read.parquet(inputDir)
+    println(s"Read ${df.count()} records from parquet files")
+    df
   }
   
-  // Show table information
-  println("External table schema:")
-  salesDataDF.printSchema()
+  // Show schema to verify column names and types for joins
+  println("Processed sales data schema:")
+  salesDF.printSchema()
   
-  println("Sample data from external table:")
-  salesDataDF.show(5)
+  println("Processed sales data sample:")
+  salesDF.show(5)
   
-  println(s"Total records in external table: ${salesDataDF.count()}")
+  // Step 2: Create customer analytics
+  logLineage("CREATE_CUSTOMER_ANALYTICS", "Sales DataFrame", "Customer Analytics")
   
-  // Cache the data for better performance
-  salesDataDF.persist(StorageLevel.MEMORY_AND_DISK)
+  // Check that expected columns exist
+  val hasRequiredColumns = salesDF.columns.toSet.intersect(
+    Set("customer_id", "customer_name", "order_id", "total_amount", "order_date")
+  ).size == 5
   
-  // Log lineage for data loading from external table
-  logLineage(
-    "Load Data from External Table", 
-    Seq(s"External Table: sales_data_external at $externalTableLocation"), 
-    "salesDataDF"
-  )
+  if (!hasRequiredColumns) {
+    throw new Exception("Sales data is missing required columns for customer analytics")
+  }
   
-  // TRANSFORMATION 1: Extract customer analytics
-  println("Creating customer analytics...")
-  
-  // Make sure to use fully qualified column references
-  val customerAnalyticsDF = salesDataDF
-    .filter(salesDataDF("customer_id").isNotNull) // Filter out summary rows
-    .groupBy(
-      salesDataDF("customer_id"),
-      salesDataDF("customer_name")
-    )
+  // Create customer analytics with explicit aggregate functions
+  val customerAnalyticsDF = salesDF
+    .groupBy(col("customer_id"), col("customer_name"))
     .agg(
-      count(salesDataDF("order_id")).as("total_orders"),
-      countDistinct(salesDataDF("product_id")).as("unique_products_purchased"),
-      sum(salesDataDF("final_price")).as("total_spent"),
-      max(salesDataDF("order_date")).as("last_purchase_date"),
-      min(salesDataDF("order_date")).as("first_purchase_date"),
-      avg(salesDataDF("final_price") / salesDataDF("quantity")).as("avg_unit_price"),
-      sum(when(salesDataDF("is_weekend") === true, salesDataDF("final_price")).otherwise(0)).as("weekend_spending"),
-      sum(when(salesDataDF("is_weekend") === false, salesDataDF("final_price")).otherwise(0)).as("weekday_spending")
+      count(col("order_id")).as("order_count"),
+      sum(col("total_amount")).as("total_spent"),
+      max(col("order_date")).as("last_order_date")
     )
-    
-  // Add calculated customer metrics with explicit references
-  val enhancedCustomerAnalyticsDF = customerAnalyticsDF
-    .withColumn("days_as_customer", datediff(current_date(), col("first_purchase_date")))
-    .withColumn("days_since_last_purchase", datediff(current_date(), col("last_purchase_date")))
-    .withColumn("purchase_frequency_days", 
-      when(col("total_orders") > 1, 
-          col("days_as_customer") / (col("total_orders") - 1)
-      ).otherwise(null))
-    .withColumn("customer_value_score", 
-      (col("total_spent") / lit(100)) * 
-      (lit(1) + when(col("days_since_last_purchase") < 30, 0.5).otherwise(-0.2)) *
-      (when(col("total_orders") > 10, 1.2).otherwise(1.0))
+    // Safe division to avoid divide-by-zero errors
+    .withColumn("customer_value", 
+      when(col("order_count") > 0, col("total_spent") / col("order_count"))
+      .otherwise(0.0)
     )
-    .withColumn("weekend_shopper_ratio", 
-      when(col("weekend_spending") + col("weekday_spending") > 0,
-        col("weekend_spending") / (col("weekend_spending") + col("weekday_spending"))
-      ).otherwise(0)
-    )
-  
-  // Show customer analytics
-  println("Sample customer analytics:")
-  enhancedCustomerAnalyticsDF.select("customer_id", "customer_name", "total_orders", "total_spent", "customer_value_score").show(5)
-  
-  // Log lineage for customer analytics transformation
-  logLineage(
-    "Extract and Enhance Customer Analytics", 
-    Seq("salesDataDF"), 
-    "enhancedCustomerAnalyticsDF"
-  )
-  
-  // TRANSFORMATION 2: Extract product analytics
-  println("Creating product analytics...")
-  val productAnalyticsDF = salesDataDF
-    .filter(salesDataDF("product_id").isNotNull) // Filter out summary rows
-    .groupBy(
-      salesDataDF("product_id"), 
-      salesDataDF("product_name"), 
-      salesDataDF("category")
-    )
-    .agg(
-      count(salesDataDF("order_id")).as("order_count"),
-      sum(salesDataDF("quantity")).as("total_quantity_sold"),
-      sum(salesDataDF("final_price")).as("total_revenue"),
-      avg(salesDataDF("price")).as("avg_price"),
-      avg(when(salesDataDF("discount_amount") > 0 && salesDataDF("extended_price") > 0,
-        salesDataDF("discount_amount") / salesDataDF("extended_price")
-      ).otherwise(0)).as("avg_discount_rate"),
-      countDistinct(salesDataDF("customer_id")).as("unique_customers")
-    )
-    .withColumn("revenue_per_unit", 
-      when(col("total_quantity_sold") > 0, 
-        col("total_revenue") / col("total_quantity_sold")
-      ).otherwise(0)
-    )
-    
-  // Add product ranking within category
-  val windowByCategoryRevenue = Window.partitionBy(col("category")).orderBy(col("total_revenue").desc)
-  val rankedProductAnalyticsDF = productAnalyticsDF
-    .withColumn("revenue_rank_in_category", rank().over(windowByCategoryRevenue))
-    .withColumn("percent_rank_in_category", percent_rank().over(windowByCategoryRevenue))
-    .withColumn("is_top_seller", col("revenue_rank_in_category") <= 3)
-  
-  // Show product analytics
-  println("Sample product analytics with ranking:")
-  rankedProductAnalyticsDF.select("product_id", "product_name", "category", "total_revenue", "revenue_rank_in_category", "is_top_seller").show(5)
-  
-  // Log lineage for product analytics transformation
-  logLineage(
-    "Extract and Rank Product Analytics", 
-    Seq("salesDataDF"), 
-    "rankedProductAnalyticsDF"
-  )
-  
-  // TRANSFORMATION 3: Extract time-based analytics
-  println("Creating time-based analytics...")
-  val timeAnalyticsDF = salesDataDF
-    .filter(salesDataDF("order_date").isNotNull) // Filter out summary rows
-    .withColumn("date", to_date(salesDataDF("order_date")))
-    .groupBy(
-      col("date"), 
-      salesDataDF("day_of_week"), 
-      salesDataDF("month"), 
-      salesDataDF("year")
-    )
-    .agg(
-      count(salesDataDF("order_id")).as("order_count"),
-      countDistinct(salesDataDF("customer_id")).as("unique_customers"),
-      sum(salesDataDF("final_price")).as("total_revenue"),
-      avg(salesDataDF("final_price")).as("avg_order_value"),
-      sum(salesDataDF("quantity")).as("items_sold"),
-      countDistinct(salesDataDF("product_id")).as("unique_products_sold")
-    )
-    .withColumn("revenue_per_customer", 
-      when(col("unique_customers") > 0, 
-        col("total_revenue") / col("unique_customers")
-      ).otherwise(0)
-    )
-    .withColumn("items_per_order", 
-      when(col("order_count") > 0, 
-        col("items_sold") / col("order_count")
-      ).otherwise(0)
-    )
-    
-  // Make sure we have at least 7 days of data for meaningful trends
-  // This is important for our sample data which might not have enough history
-  val minDate = timeAnalyticsDF.agg(min(col("date"))).first().getDate(0)
-  val maxDate = timeAnalyticsDF.agg(max(col("date"))).first().getDate(0)
-  
-  println(s"Date range in data: $minDate to $maxDate")
-  
-  // Create a complete date series to fill any gaps
-  val dateRange = (0 until 100).map(i => 
-    Date.valueOf(LocalDate.now().minusDays(i))
-  ).toDF("date")
-  
-  // Join with our time analytics to ensure no gaps
-  val completeTimeAnalyticsDF = dateRange
-    .join(timeAnalyticsDF, Seq("date"), "left")
-    .na.fill(0, Seq("order_count", "unique_customers", "total_revenue", "items_sold"))
-    .na.fill("Unknown", Seq("day_of_week", "month"))
-    .orderBy(col("date"))
-  
-  // Calculate moving averages for trending
-  // Adjust window size based on available data
-  val windowSpec3Day = Window
-    .orderBy(col("date"))
-    .rangeBetween(-2, 0) // 3-day window
-    
-  val windowSpec7Day = Window
-    .orderBy(col("date"))
-    .rangeBetween(-6, 0) // 7-day window
-    
-  val trendingTimeAnalyticsDF = completeTimeAnalyticsDF
-    .withColumn("revenue_3day_avg", avg(col("total_revenue")).over(windowSpec3Day))
-    .withColumn("revenue_7day_avg", avg(col("total_revenue")).over(windowSpec7Day))
-    .withColumn("order_count_3day_avg", avg(col("order_count")).over(windowSpec3Day))
-    .withColumn("order_count_7day_avg", avg(col("order_count")).over(windowSpec7Day))
-    .withColumn("is_revenue_trending_up", 
-      when(col("revenue_3day_avg") > col("revenue_7day_avg") * 1.05, true)  // 5% higher than 7-day average
-      .otherwise(false)
-    )
-  
-  // Show time analytics
-  println("Sample time-based analytics with trending:")
-  trendingTimeAnalyticsDF
-    .filter(col("total_revenue") > 0)  // Only show days with revenue
-    .select("date", "total_revenue", "revenue_3day_avg", "revenue_7day_avg", "is_revenue_trending_up")
-    .orderBy(col("date").desc)
-    .show(5)
-  
-  // Log lineage for time analytics transformation  
-  logLineage(
-    "Extract Time-Based Analytics with Trends", 
-    Seq("salesDataDF"), 
-    "trendingTimeAnalyticsDF"
-  )
-  
-  // TRANSFORMATION 4: Create assets by joining all analytics perspectives
-  println("Creating unified asset view...")
-  
-  // First, create a date dimension to join with
-  val today = LocalDate.now()
-  val dateDf = (0 until 365).map(i => {
-    val date = today.minusDays(i)
-    (Date.valueOf(date),
-     date.getDayOfWeek.toString,
-     date.getMonthValue,
-     date.getMonth.toString,
-     date.getYear)
-  }).toDF("date", "day_of_week", "month_num", "month_name", "year")
-  
-  // Prepare for joining to the date dimension - use specific column references
-  val timeAnalyticsForJoin = trendingTimeAnalyticsDF
-    .withColumnRenamed("month", "month_name")
-    .join(dateDf, Seq("date"), "left")
-    .select(
-      trendingTimeAnalyticsDF("date"),
-      dateDf("day_of_week"),
-      dateDf("month_num"),
-      dateDf("month_name"),
-      dateDf("year"),
-      trendingTimeAnalyticsDF("order_count"),
-      trendingTimeAnalyticsDF("unique_customers"),
-      trendingTimeAnalyticsDF("total_revenue"),
-      trendingTimeAnalyticsDF("avg_order_value"),
-      trendingTimeAnalyticsDF("items_sold"),
-      trendingTimeAnalyticsDF("unique_products_sold"),
-      trendingTimeAnalyticsDF("revenue_per_customer"),
-      trendingTimeAnalyticsDF("items_per_order"),
-      trendingTimeAnalyticsDF("revenue_3day_avg"),
-      trendingTimeAnalyticsDF("revenue_7day_avg"),
-      trendingTimeAnalyticsDF("order_count_3day_avg"),
-      trendingTimeAnalyticsDF("order_count_7day_avg"),
-      trendingTimeAnalyticsDF("is_revenue_trending_up")
-    )
-  
-  // Create customer dimension asset
-  val customerAssetDF = enhancedCustomerAnalyticsDF
     .withColumn("asset_type", lit("customer"))
-    .withColumn("asset_id", concat(lit("CUST_"), col("customer_id")))
-    .withColumn("asset_name", col("customer_name"))
-    .withColumn("asset_created_date", current_timestamp())
+    .withColumn("asset_id", concat(lit("CUST_"), col("customer_id").cast("string")))
+    .withColumn("asset_created", current_timestamp())
     .withColumn("asset_job_id", lit(jobId))
   
-  // Create product dimension asset
-  val productAssetDF = rankedProductAnalyticsDF
+  println("Customer analytics:")
+  println(s"Customer records: ${customerAnalyticsDF.count()}")
+  customerAnalyticsDF.show(5)
+  
+  // Step 3: Create product analytics
+  logLineage("CREATE_PRODUCT_ANALYTICS", "Sales DataFrame", "Product Analytics")
+  
+  // Check that expected columns exist
+  val hasProductColumns = salesDF.columns.toSet.intersect(
+    Set("product_id", "product_name", "category", "quantity", "extended_price")
+  ).size == 5
+  
+  if (!hasProductColumns) {
+    throw new Exception("Sales data is missing required columns for product analytics")
+  }
+  
+  val productAnalyticsDF = salesDF
+    .groupBy(col("product_id"), col("product_name"), col("category"))
+    .agg(
+      count(col("order_id")).as("order_count"),
+      sum(col("quantity")).as("units_sold"),
+      sum(col("extended_price")).as("total_revenue")
+    )
+    // Safe division to avoid divide-by-zero errors
+    .withColumn("avg_unit_price", 
+      when(col("units_sold") > 0, col("total_revenue") / col("units_sold"))
+      .otherwise(0.0)
+    )
     .withColumn("asset_type", lit("product"))
-    .withColumn("asset_id", concat(lit("PROD_"), col("product_id")))
-    .withColumn("asset_name", col("product_name"))
-    .withColumn("asset_created_date", current_timestamp())
+    .withColumn("asset_id", concat(lit("PROD_"), col("product_id").cast("string")))
+    .withColumn("asset_created", current_timestamp())
     .withColumn("asset_job_id", lit(jobId))
   
-  // Create time dimension asset
-  val timeAssetDF = timeAnalyticsForJoin
+  println("Product analytics:")
+  println(s"Product records: ${productAnalyticsDF.count()}")
+  productAnalyticsDF.show(5)
+  
+  // Step 4: Create time analytics
+  logLineage("CREATE_TIME_ANALYTICS", "Sales DataFrame", "Time Analytics")
+  
+  // Check that expected columns exist
+  val hasTimeColumns = salesDF.columns.toSet.intersect(
+    Set("month", "year", "order_id", "customer_id", "total_amount")
+  ).size == 5
+  
+  if (!hasTimeColumns) {
+    throw new Exception("Sales data is missing required columns for time analytics")
+  }
+  
+  val timeAnalyticsDF = salesDF
+    .groupBy(col("month"), col("year"))
+    .agg(
+      count(col("order_id")).as("order_count"),
+      countDistinct(col("customer_id")).as("unique_customers"),
+      sum(col("total_amount")).as("total_revenue")
+    )
+    // Safe division to avoid divide-by-zero errors
+    .withColumn("avg_order_value", 
+      when(col("order_count") > 0, col("total_revenue") / col("order_count"))
+      .otherwise(0.0)
+    )
     .withColumn("asset_type", lit("time"))
-    .withColumn("asset_id", concat(lit("DATE_"), date_format(col("date"), "yyyyMMdd")))
-    .withColumn("asset_name", date_format(col("date"), "yyyy-MM-dd"))
-    .withColumn("asset_created_date", current_timestamp())
+    .withColumn("asset_id", concat(lit("TIME_"), col("year").cast("string"), lit("_"), col("month")))
+    .withColumn("asset_created", current_timestamp())
     .withColumn("asset_job_id", lit(jobId))
   
-  // Log lineage for asset transformation
-  logLineage(
-    "Create Dimension Assets", 
-    Seq("enhancedCustomerAnalyticsDF", "rankedProductAnalyticsDF", "trendingTimeAnalyticsDF"), 
-    "Multiple Dimension Assets"
+  println("Time analytics:")
+  println(s"Time period records: ${timeAnalyticsDF.count()}")
+  timeAnalyticsDF.show(5)
+  
+  // Step 5: Create unified asset
+  logLineage("CREATE_UNIFIED_ASSET", "All Analytics DataFrames", "Unified Asset")
+  
+  // Cast all common columns to ensure consistent types for union
+  // This prevents "Failed to merge incompatible data types" errors
+  val customerColumns = customerAnalyticsDF.select(
+    col("asset_type").cast(StringType), 
+    col("asset_id").cast(StringType), 
+    col("asset_created").cast(TimestampType), 
+    col("asset_job_id").cast(StringType),
+    col("customer_id").cast(IntegerType), 
+    col("customer_name").cast(StringType), 
+    col("order_count").cast(LongType), 
+    col("total_spent").cast(DoubleType),
+    lit(null).cast(IntegerType).as("product_id"), 
+    lit(null).cast(StringType).as("product_name"), 
+    lit(null).cast(StringType).as("category"),
+    lit(null).cast(StringType).as("month"), 
+    lit(null).cast(IntegerType).as("year")
   )
   
-  // Construct the unified asset view
-  println("Creating unified asset schema...")
-  
-  // Customer columns
-  val customerColumns = customerAssetDF.select(
-    col("asset_type"), col("asset_id"), col("asset_name"), col("asset_created_date"), col("asset_job_id"),
-    col("customer_id"), col("total_orders"), col("total_spent"), col("customer_value_score"), 
-    col("first_purchase_date"), col("last_purchase_date"), col("days_since_last_purchase"),
-    lit(null).cast("string").as("category"),
-    lit(null).cast("int").as("revenue_rank_in_category"),
-    lit(null).cast("date").as("date"),
-    lit(null).cast("string").as("day_of_week"),
-    lit(null).cast("int").as("month_num"),
-    lit(null).cast("string").as("month_name"),
-    lit(null).cast("int").as("year"),
-    lit(null).cast("double").as("total_revenue"),
-    lit(null).cast("boolean").as("is_revenue_trending_up")
+  val productColumns = productAnalyticsDF.select(
+    col("asset_type").cast(StringType), 
+    col("asset_id").cast(StringType), 
+    col("asset_created").cast(TimestampType), 
+    col("asset_job_id").cast(StringType),
+    lit(null).cast(IntegerType).as("customer_id"), 
+    lit(null).cast(StringType).as("customer_name"), 
+    col("order_count").cast(LongType), 
+    lit(null).cast(DoubleType).as("total_spent"),
+    col("product_id").cast(IntegerType), 
+    col("product_name").cast(StringType), 
+    col("category").cast(StringType),
+    lit(null).cast(StringType).as("month"), 
+    lit(null).cast(IntegerType).as("year")
   )
   
-  // Product columns
-  val productColumns = productAssetDF.select(
-    col("asset_type"), col("asset_id"), col("asset_name"), col("asset_created_date"), col("asset_job_id"),
-    lit(null).cast("int").as("customer_id"),
-    lit(null).cast("int").as("total_orders"),
-    lit(null).cast("double").as("total_spent"),
-    lit(null).cast("double").as("customer_value_score"),
-    lit(null).cast("timestamp").as("first_purchase_date"),
-    lit(null).cast("timestamp").as("last_purchase_date"),
-    lit(null).cast("int").as("days_since_last_purchase"),
-    col("category"), col("revenue_rank_in_category"), 
-    lit(null).cast("date").as("date"),
-    lit(null).cast("string").as("day_of_week"),
-    lit(null).cast("int").as("month_num"),
-    lit(null).cast("string").as("month_name"),
-    lit(null).cast("int").as("year"),
-    col("total_revenue"),
-    lit(null).cast("boolean").as("is_revenue_trending_up")
+  val timeColumns = timeAnalyticsDF.select(
+    col("asset_type").cast(StringType), 
+    col("asset_id").cast(StringType), 
+    col("asset_created").cast(TimestampType), 
+    col("asset_job_id").cast(StringType),
+    lit(null).cast(IntegerType).as("customer_id"), 
+    lit(null).cast(StringType).as("customer_name"), 
+    col("order_count").cast(LongType), 
+    lit(null).cast(DoubleType).as("total_spent"),
+    lit(null).cast(IntegerType).as("product_id"), 
+    lit(null).cast(StringType).as("product_name"), 
+    lit(null).cast(StringType).as("category"),
+    col("month").cast(StringType), 
+    col("year").cast(IntegerType)
   )
   
-  // Time columns
-  val timeColumns = timeAssetDF.select(
-    col("asset_type"), col("asset_id"), col("asset_name"), col("asset_created_date"), col("asset_job_id"),
-    lit(null).cast("int").as("customer_id"),
-    col("order_count").as("total_orders"),
-    lit(null).cast("double").as("total_spent"),
-    lit(null).cast("double").as("customer_value_score"),
-    lit(null).cast("timestamp").as("first_purchase_date"),
-    lit(null).cast("timestamp").as("last_purchase_date"),
-    lit(null).cast("int").as("days_since_last_purchase"),
-    lit(null).cast("string").as("category"),
-    lit(null).cast("int").as("revenue_rank_in_category"),
-    col("date"), col("day_of_week"), col("month_num"), col("month_name"), col("year"),
-    col("total_revenue"), col("is_revenue_trending_up")
-  )
+  // Union all assets
+  // In Spark 3.x, we can use unionByName instead for better column matching
+  val sparkVersion = spark.version
   
-  // Union all asset types into a unified view
-  val unifiedAssetDF = customerColumns
-    .union(productColumns)
-    .union(timeColumns)
-    .withColumn("asset_lineage_source", lit(externalTableLocation))
-    .withColumn("asset_lineage_job", lit(jobId))
+  val unifiedAssetDF = if (sparkVersion.startsWith("3.")) {
+    println("Using unionByName for Spark 3.x")
+    // Use unionByName with allowMissingColumns=true for Spark 3.x
+    customerColumns
+      .unionByName(productColumns, true)
+      .unionByName(timeColumns, true)
+      .withColumn("asset_source", lit(inputDir))
+  } else {
+    println("Using standard union for Spark 2.x")
+    // For Spark 2.x, use regular union with explicit column selection
+    customerColumns
+      .union(productColumns)
+      .union(timeColumns)
+      .withColumn("asset_source", lit(inputDir))
+  }
   
-  // Show sample unified asset data
-  println("Sample unified asset data:")
-  unifiedAssetDF.select("asset_type", "asset_id", "asset_name", "asset_job_id").show(5)
+  println("Unified asset:")
+  println(s"Total asset records: ${unifiedAssetDF.count()}")
+  unifiedAssetDF.show(10)
   
-  println(s"Total records in unified asset: ${unifiedAssetDF.count()}")
+  // Step 6: Write asset data
+  logLineage("WRITE_ASSET", "Unified Asset", outputDir)
   
-  // Log lineage for unified asset creation
-  logLineage(
-    "Create Unified Asset View", 
-    Seq("customerAssetDF", "productAssetDF", "timeAssetDF"), 
-    "unifiedAssetDF"
-  )
+  // Ensure output directory is clean
+  val hadoopConf = new org.apache.hadoop.conf.Configuration()
+  val hdfs = org.apache.hadoop.fs.FileSystem.get(hadoopConf)
+  val outputPath = new org.apache.hadoop.fs.Path(outputDir)
+  if (hdfs.exists(outputPath)) {
+    hdfs.delete(outputPath, true)
+    println(s"Deleted existing directory: $outputDir")
+  }
   
-  // Create the target Hive table for the asset
-  println("Creating asset table in Hive...")
-  spark.sql("DROP TABLE IF EXISTS sales_analytics_asset")
-  spark.sql(
-    s"""
-      |CREATE TABLE sales_analytics_asset (
-      |  asset_type STRING,
-      |  asset_id STRING,
-      |  asset_name STRING,
-      |  asset_created_date TIMESTAMP,
-      |  asset_job_id STRING,
-      |  customer_id INT,
-      |  total_orders INT,
-      |  total_spent DOUBLE,
-      |  customer_value_score DOUBLE,
-      |  first_purchase_date TIMESTAMP,
-      |  last_purchase_date TIMESTAMP,
-      |  days_since_last_purchase INT,
-      |  category STRING,
-      |  revenue_rank_in_category INT,
-      |  date DATE,
-      |  day_of_week STRING,
-      |  month_num INT,
-      |  month_name STRING,
-      |  year INT,
-      |  total_revenue DOUBLE,
-      |  is_revenue_trending_up BOOLEAN,
-      |  asset_lineage_source STRING,
-      |  asset_lineage_job STRING
-      |)
-      |STORED AS PARQUET
-      |LOCATION '$assetTableLocation'
-    """.stripMargin
-  )
-  
-  // Write the asset data
-  println("Writing data to asset table...")
+  // Write data
   unifiedAssetDF.write
     .mode("overwrite")
-    .format("parquet")
-    .save(assetTableLocation)
+    .parquet(outputDir)
   
-  // Verify the data was written correctly
-  val verifyAssetDF = spark.sql("SELECT * FROM sales_analytics_asset LIMIT 10")
-  println("Verifying data in asset table:")
-  verifyAssetDF.show(5)
+  println(s"Asset data written to: $outputDir")
   
-  // Count the records in the asset table
-  val assetRecordCount = spark.sql("SELECT COUNT(*) FROM sales_analytics_asset").first().getLong(0)
-  println(s"Total records in asset table: $assetRecordCount")
+  // Verify written data by reading it back
+  val verifyDF = spark.read.parquet(outputDir)
+  println("Verification of written asset data:")
+  println(s"Total asset records: ${verifyDF.count()}")
+  verifyDF.show(3)
   
-  // Log lineage for writing the asset
-  logLineage(
-    "Write Unified Asset to Hive Table", 
-    Seq("unifiedAssetDF"), 
-    s"Hive Table: sales_analytics_asset at $assetTableLocation"
-  )
+  // Create Hive table for the asset
+  spark.sql("DROP TABLE IF EXISTS sales_analytics_asset")
+  spark.sql(s"""
+    CREATE TABLE sales_analytics_asset
+    USING PARQUET
+    LOCATION '$outputDir'
+  """)
   
-  // Create lineage table in Hive to explicitly track data flow
-  println("Creating data lineage table in Hive...")
-  spark.sql("CREATE TABLE IF NOT EXISTS data_lineage_registry (job_id STRING, job_timestamp TIMESTAMP, source_path STRING, target_path STRING, transformation_count INT, record_count BIGINT, source_files STRING, description STRING)")
+  println("Created Hive table: sales_analytics_asset")
   
-  // Build lineage data with explicit source reference to the first job's output
-  val lineageData = Seq(
-    (
-      jobId, 
-      Timestamp.valueOf(jobStartTime), 
-      externalTableLocation, 
-      assetTableLocation, 
-      4, // number of transformations in this job
-      unifiedAssetDF.count(),
-      "sales_data_external",
-      s"Created sales analytics asset from processed sales data at ${LocalDateTime.now}"
-    )
-  ).toDF("job_id", "job_timestamp", "source_path", "target_path", "transformation_count", "record_count", "source_files", "description")
+  // Create lineage registry table and add entry
+  spark.sql("CREATE TABLE IF NOT EXISTS lineage_registry (job_id STRING, job_time TIMESTAMP, source_path STRING, target_path STRING)")
   
-  // Insert lineage data into registry
-  println("Registering lineage metadata...")
-  lineageData.write
-    .mode("append")
-    .format("hive")
-    .saveAsTable("data_lineage_registry")
+  val lineageDF = Seq(
+    (jobId, java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()), inputDir, outputDir)
+  ).toDF("job_id", "job_time", "source_path", "target_path")
   
-  // Final lineage log
-  logLineage(
-    "Register Data Lineage", 
-    Seq(externalTableLocation), 
-    "data_lineage_registry table entry"
-  )
+  lineageDF.write.mode("append").insertInto("lineage_registry")
   
-  // Unpersist cached DataFrame
-  salesDataDF.unpersist()
+  println("Added entry to lineage registry")
+  println("Lineage registry contents:")
+  spark.sql("SELECT * FROM lineage_registry").show()
   
-  // Print completion message with lineage summary
-  val jobEndTime = LocalDateTime.now
-  println(s"""
-    |==========================================================
-    |JOB COMPLETE: Asset Creation with Lineage Tracking
-    |==========================================================
-    |Job ID: $jobId
-    |Start Time: $jobStartTime
-    |End Time: $jobEndTime
-    |Duration: ${java.time.Duration.between(jobStartTime, jobEndTime).getSeconds} seconds
-    |
-    |Input Source:
-    |  - External Hive Table: sales_data_external
-    |  - Location: $externalTableLocation
-    |
-    |Transformations Applied:
-    |  1. Extract customer analytics with enhanced metrics
-    |  2. Extract product analytics with ranking
-    |  3. Extract time-based analytics with trending
-    |  4. Create unified asset view combining all dimensions
-    |
-    |Output:
-    |  - Hive Table: sales_analytics_asset
-    |  - Location: $assetTableLocation
-    |  - Lineage Registry: Entry added to data_lineage_registry
-    |  - Record Count: $assetRecordCount
-    |==========================================================
-  """.stripMargin)
-
+  println("=== Asset Creation Job Complete ===")
+  
 } catch {
-  case e: Exception => 
-    println(s"ERROR: Asset creation job failed with exception:")
-    println(s"${e.getMessage}")
-    println(s"${e.getStackTrace.mkString("\n")}")
+  case e: Exception =>
+    println(s"ERROR: ${e.getMessage}")
+    e.printStackTrace()
     
-    // Log error in lineage format
-    logLineage(
-      "ERROR: Asset Creation Failed", 
-      Seq(externalTableLocation), 
-      s"Error: ${e.getMessage}"
-    )
+    // Log lineage error for tracking failures
+    logLineage("ERROR", "Failed process", e.getMessage)
     
-    throw e
+    throw e // Re-throw to ensure the script fails properly
 }
