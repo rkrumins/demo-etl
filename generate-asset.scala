@@ -1,5 +1,5 @@
-// Updated Spark Shell Script 2: Asset Creation from External Table
-// Run with: spark-shell -i generate-asset.scala
+// Fixed Spark Shell Script 2: Asset Creation with Resolved Column Ambiguity
+// Run with: spark-shell -i spark-shell-job2-fixed.scala
 
 import org.apache.spark.sql.{SparkSession, DataFrame}
 import org.apache.spark.sql.functions._
@@ -38,9 +38,18 @@ println(s"Writing to asset table at: $assetTableLocation")
 try {
   // Read from external table
   println("Reading data from external Hive table...")
-  val salesDataDF = spark.read
-    .format("parquet")
-    .load(externalTableLocation)
+  
+  // First check if the external table exists
+  println("Checking if external table exists...")
+  val tableExists = spark.catalog.tableExists("sales_data_external")
+  
+  val salesDataDF = if (tableExists) {
+    println("Reading from Hive table 'sales_data_external'")
+    spark.table("sales_data_external")
+  } else {
+    println("Reading directly from parquet files at: " + externalTableLocation)
+    spark.read.format("parquet").load(externalTableLocation)
+  }
   
   // Show table information
   println("External table schema:")
@@ -63,21 +72,26 @@ try {
   
   // TRANSFORMATION 1: Extract customer analytics
   println("Creating customer analytics...")
+  
+  // Make sure to use fully qualified column references
   val customerAnalyticsDF = salesDataDF
-    .filter(col("customer_id").isNotNull) // Filter out summary rows
-    .groupBy(col("customer_id"), col("customer_name"))
+    .filter(salesDataDF("customer_id").isNotNull) // Filter out summary rows
+    .groupBy(
+      salesDataDF("customer_id"),
+      salesDataDF("customer_name")
+    )
     .agg(
-      count(col("order_id")).as("total_orders"),
-      countDistinct(col("product_id")).as("unique_products_purchased"),
-      sum(col("final_price")).as("total_spent"),
-      max(col("order_date")).as("last_purchase_date"),
-      min(col("order_date")).as("first_purchase_date"),
-      avg(col("final_price") / col("quantity")).as("avg_unit_price"),
-      sum(when(col("is_weekend") === true, col("final_price")).otherwise(0)).as("weekend_spending"),
-      sum(when(col("is_weekend") === false, col("final_price")).otherwise(0)).as("weekday_spending")
+      count(salesDataDF("order_id")).as("total_orders"),
+      countDistinct(salesDataDF("product_id")).as("unique_products_purchased"),
+      sum(salesDataDF("final_price")).as("total_spent"),
+      max(salesDataDF("order_date")).as("last_purchase_date"),
+      min(salesDataDF("order_date")).as("first_purchase_date"),
+      avg(salesDataDF("final_price") / salesDataDF("quantity")).as("avg_unit_price"),
+      sum(when(salesDataDF("is_weekend") === true, salesDataDF("final_price")).otherwise(0)).as("weekend_spending"),
+      sum(when(salesDataDF("is_weekend") === false, salesDataDF("final_price")).otherwise(0)).as("weekday_spending")
     )
     
-  // Add calculated customer metrics
+  // Add calculated customer metrics with explicit references
   val enhancedCustomerAnalyticsDF = customerAnalyticsDF
     .withColumn("days_as_customer", datediff(current_date(), col("first_purchase_date")))
     .withColumn("days_since_last_purchase", datediff(current_date(), col("last_purchase_date")))
@@ -110,17 +124,21 @@ try {
   // TRANSFORMATION 2: Extract product analytics
   println("Creating product analytics...")
   val productAnalyticsDF = salesDataDF
-    .filter(col("product_id").isNotNull) // Filter out summary rows
-    .groupBy(col("product_id"), col("product_name"), col("category"))
+    .filter(salesDataDF("product_id").isNotNull) // Filter out summary rows
+    .groupBy(
+      salesDataDF("product_id"), 
+      salesDataDF("product_name"), 
+      salesDataDF("category")
+    )
     .agg(
-      count(col("order_id")).as("order_count"),
-      sum(col("quantity")).as("total_quantity_sold"),
-      sum(col("final_price")).as("total_revenue"),
-      avg(col("price")).as("avg_price"),
-      avg(when(col("discount_amount") > 0 && col("extended_price") > 0,
-        col("discount_amount") / col("extended_price")
+      count(salesDataDF("order_id")).as("order_count"),
+      sum(salesDataDF("quantity")).as("total_quantity_sold"),
+      sum(salesDataDF("final_price")).as("total_revenue"),
+      avg(salesDataDF("price")).as("avg_price"),
+      avg(when(salesDataDF("discount_amount") > 0 && salesDataDF("extended_price") > 0,
+        salesDataDF("discount_amount") / salesDataDF("extended_price")
       ).otherwise(0)).as("avg_discount_rate"),
-      countDistinct(col("customer_id")).as("unique_customers")
+      countDistinct(salesDataDF("customer_id")).as("unique_customers")
     )
     .withColumn("revenue_per_unit", 
       when(col("total_quantity_sold") > 0, 
@@ -149,16 +167,21 @@ try {
   // TRANSFORMATION 3: Extract time-based analytics
   println("Creating time-based analytics...")
   val timeAnalyticsDF = salesDataDF
-    .filter(col("order_date").isNotNull) // Filter out summary rows
-    .withColumn("date", to_date(col("order_date")))
-    .groupBy(col("date"), col("day_of_week"), col("month"), col("year"))
+    .filter(salesDataDF("order_date").isNotNull) // Filter out summary rows
+    .withColumn("date", to_date(salesDataDF("order_date")))
+    .groupBy(
+      col("date"), 
+      salesDataDF("day_of_week"), 
+      salesDataDF("month"), 
+      salesDataDF("year")
+    )
     .agg(
-      count(col("order_id")).as("order_count"),
-      countDistinct(col("customer_id")).as("unique_customers"),
-      sum(col("final_price")).as("total_revenue"),
-      avg(col("final_price")).as("avg_order_value"),
-      sum(col("quantity")).as("items_sold"),
-      countDistinct(col("product_id")).as("unique_products_sold")
+      count(salesDataDF("order_id")).as("order_count"),
+      countDistinct(salesDataDF("customer_id")).as("unique_customers"),
+      sum(salesDataDF("final_price")).as("total_revenue"),
+      avg(salesDataDF("final_price")).as("avg_order_value"),
+      sum(salesDataDF("quantity")).as("items_sold"),
+      countDistinct(salesDataDF("product_id")).as("unique_products_sold")
     )
     .withColumn("revenue_per_customer", 
       when(col("unique_customers") > 0, 
@@ -239,10 +262,30 @@ try {
      date.getYear)
   }).toDF("date", "day_of_week", "month_num", "month_name", "year")
   
-  // Prepare for joining to the date dimension
+  // Prepare for joining to the date dimension - use specific column references
   val timeAnalyticsForJoin = trendingTimeAnalyticsDF
     .withColumnRenamed("month", "month_name")
     .join(dateDf, Seq("date"), "left")
+    .select(
+      trendingTimeAnalyticsDF("date"),
+      dateDf("day_of_week"),
+      dateDf("month_num"),
+      dateDf("month_name"),
+      dateDf("year"),
+      trendingTimeAnalyticsDF("order_count"),
+      trendingTimeAnalyticsDF("unique_customers"),
+      trendingTimeAnalyticsDF("total_revenue"),
+      trendingTimeAnalyticsDF("avg_order_value"),
+      trendingTimeAnalyticsDF("items_sold"),
+      trendingTimeAnalyticsDF("unique_products_sold"),
+      trendingTimeAnalyticsDF("revenue_per_customer"),
+      trendingTimeAnalyticsDF("items_per_order"),
+      trendingTimeAnalyticsDF("revenue_3day_avg"),
+      trendingTimeAnalyticsDF("revenue_7day_avg"),
+      trendingTimeAnalyticsDF("order_count_3day_avg"),
+      trendingTimeAnalyticsDF("order_count_7day_avg"),
+      trendingTimeAnalyticsDF("is_revenue_trending_up")
+    )
   
   // Create customer dimension asset
   val customerAssetDF = enhancedCustomerAnalyticsDF
