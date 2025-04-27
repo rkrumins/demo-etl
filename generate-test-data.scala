@@ -1,4 +1,4 @@
-// Fixed Spark Job 1: Data Processing (generate-test-data.scala)
+// Spark Job 1: Fixed Column Ambiguity Issues (generate-test-data.scala)
 // Run with: spark-shell -i generate-test-data.scala
 
 // Import necessary libraries
@@ -60,91 +60,65 @@ try {
     .schema(orderSchema)
     .csv(s"$inputDir/orders.csv")
   
-  // Verify data loading and schema
-  println("Customers schema:")
-  customersDF.printSchema()
-  println("Customers sample:")
-  customersDF.show(3)
-  
-  println("Products schema:")
-  productsDF.printSchema()
-  println("Products sample:")
-  productsDF.show(3)
-  
-  println("Orders schema:")
-  ordersDF.printSchema()
-  println("Orders sample:")
-  ordersDF.show(3)
-  
-  // Count records to verify data loading
-  println(s"Customer count: ${customersDF.count()}")
-  println(s"Product count: ${productsDF.count()}")
-  println(s"Order count: ${ordersDF.count()}")
-  
   // Step 2: Filter data
   logLineage("FILTER_DATA", "Raw DataFrames", "Filtered DataFrames")
   
-  // Filter active customers - verify filter condition matches actual data
-  val activeCustomersDF = customersDF.filter(col("status") === "active")
+  // Rename columns that would be ambiguous in joins
+  val customersDFRenamed = customersDF
+    .withColumnRenamed("name", "customer_name")
+  
+  val productsDFRenamed = productsDF
+    .withColumnRenamed("name", "product_name")
+  
+  // Filter active customers
+  val activeCustomersDF = customersDFRenamed.filter(col("status") === "active")
   println(s"Active customers: ${activeCustomersDF.count()}")
-  activeCustomersDF.show(3)
   
-  // Filter available products - verify filter condition matches actual data
-  val availableProductsDF = productsDF.filter(col("in_stock") === true)
+  // Filter available products
+  val availableProductsDF = productsDFRenamed.filter(col("in_stock") === true)
   println(s"Available products: ${availableProductsDF.count()}")
-  availableProductsDF.show(3)
   
-  // Filter recent orders - verify date parsing
+  // Filter recent orders
   val recentOrdersDF = ordersDF.filter(
-    col("order_date") > lit("2023-02-01") // Note: our schema ensures proper date type
+    col("order_date") > lit("2023-02-01")
   )
   println(s"Recent orders: ${recentOrdersDF.count()}")
-  recentOrdersDF.show(3)
   
-  // Step 3: Join data - this is the critical part for ensuring correct joins
+  // Step 3: Join data - using explicit join conditions and column selection
   logLineage("JOIN_DATA", "Filtered DataFrames", "Sales DataFrame")
   
-  // Print distinct IDs to see what should match in the join
-  println("Distinct customer_id in active customers:")
-  activeCustomersDF.select("customer_id").distinct().orderBy("customer_id").show(100)
+  // Join orders with customers using explicit conditions
+  val ordersWithCustomersDF = recentOrdersDF
+    .join(
+      activeCustomersDF,
+      recentOrdersDF("customer_id") === activeCustomersDF("customer_id"),
+      "inner"
+    )
   
-  println("Distinct product_id in available products:")
-  availableProductsDF.select("product_id").distinct().orderBy("product_id").show(100)
+  // Join with products 
+  val joinedDataDF = ordersWithCustomersDF
+    .join(
+      availableProductsDF,
+      ordersWithCustomersDF("product_id") === availableProductsDF("product_id"),
+      "inner"
+    )
   
-  println("Distinct customer_id and product_id in recent orders:")
-  recentOrdersDF.select("customer_id", "product_id").distinct().orderBy("customer_id", "product_id").show(100)
-  
-  // First join orders with customers on customer_id
-  val ordersWithCustomersDF = recentOrdersDF.join(
-    activeCustomersDF,
-    recentOrdersDF("customer_id") === activeCustomersDF("customer_id"),
-    "inner"
-  )
-  
-  println("After joining orders with customers:")
-  println(s"Records: ${ordersWithCustomersDF.count()}")
-  ordersWithCustomersDF.show(3)
-  
-  // Then join with products on product_id
-  val salesDF = ordersWithCustomersDF.join(
-    availableProductsDF,
-    ordersWithCustomersDF("product_id") === availableProductsDF("product_id"),
-    "inner"
-  ).select(
-    ordersWithCustomersDF("order_id"),
-    ordersWithCustomersDF("customer_id"),
-    activeCustomersDF("name").as("customer_name"),
+  // Select columns with fully qualified references to avoid ambiguity
+  val salesDF = joinedDataDF.select(
+    recentOrdersDF("order_id"),
+    recentOrdersDF("customer_id"),
+    activeCustomersDF("customer_name"),
     activeCustomersDF("email"),
-    ordersWithCustomersDF("product_id"),
-    availableProductsDF("name").as("product_name"),
+    recentOrdersDF("product_id"),
+    availableProductsDF("product_name"),
     availableProductsDF("category"),
     availableProductsDF("price"),
-    ordersWithCustomersDF("quantity"),
-    ordersWithCustomersDF("order_date"),
-    ordersWithCustomersDF("total_amount")
+    recentOrdersDF("quantity"),
+    recentOrdersDF("order_date"),
+    recentOrdersDF("total_amount")
   )
   
-  println("Joined sales data (final result of both joins):")
+  println("Joined sales data:")
   println(s"Sales records: ${salesDF.count()}")
   salesDF.show(5)
   
@@ -158,7 +132,7 @@ try {
     .withColumn("extended_price", col("price") * col("quantity"))
   
   println("Enhanced sales data:")
-  enhancedSalesDF.select("order_id", "customer_name", "product_name", "month", "extended_price").show(5)
+  enhancedSalesDF.show(5)
   
   // Step 5: Write processed data
   logLineage("WRITE_PROCESSED", "Enhanced Sales DataFrame", s"$outputDir/sales")
